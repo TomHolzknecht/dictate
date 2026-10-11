@@ -68,8 +68,8 @@ In **Settings** you can change:
 Settings → **Vocabulary** edits `~/.config/dictate/vocab.txt`. One entry per line, `#` starts a comment:
 
 ```
-NetApp                      # term: hint for Whisper
-Snap Mirror -> SnapMirror   # replacement: fixes a typical mis-hearing
+Kubernetes                  # term: hint for Whisper
+Post Gres -> PostgreSQL     # replacement: fixes a typical mis-hearing
 ```
 
 - **Term** — sent to Groq/OpenAI as the Whisper `prompt`. This improves recognition while decoding. Local Parakeet has no prompt, so terms do nothing there.
