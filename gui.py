@@ -662,7 +662,9 @@ def acquire_single_instance_lock():
         else:
             import fcntl
             fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
+    except (BlockingIOError, PermissionError):
+        # Another instance holds the lock: BlockingIOError (flock on Linux/macOS),
+        # PermissionError (msvcrt.locking on Windows). Other OSErrors propagate.
         fd.close()
         core.notify("Dictate is already running", urgency="low")
         return False
