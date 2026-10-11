@@ -147,7 +147,7 @@ class SettingsDialog(QDialog):
 
         self.vocab_edit = QPlainTextEdit()
         self.vocab_edit.setFixedHeight(110)
-        self.vocab_edit.setPlaceholderText("NetApp\nSnap Mirror -> SnapMirror")
+        self.vocab_edit.setPlaceholderText("Kubernetes\nPost Gres -> PostgreSQL")
         self.vocab_edit.setToolTip(
             "Custom vocabulary, one entry per line.\n"
             "Term: hint sent to Whisper (Groq/OpenAI).\n"
