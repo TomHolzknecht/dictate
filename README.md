@@ -21,6 +21,8 @@ Hold a hotkey, speak, release — the transcribed text is typed wherever your cu
 
 ## Requirements
 
+**Supported systems:** Linux, macOS and Windows. WSL is not supported.
+
 - Linux (X11 or Wayland — see the Wayland section below)
 - Python 3.10+
 - A microphone that PipeWire/PulseAudio can see
