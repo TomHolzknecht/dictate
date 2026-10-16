@@ -3,7 +3,9 @@ import io
 import json
 import logging
 import logging.handlers
+import os
 import subprocess
+import sys
 import threading
 import wave
 from pathlib import Path
@@ -11,8 +13,11 @@ from pathlib import Path
 import numpy as np
 import requests
 import sounddevice as sd
-import sys
 from pynput import keyboard
+
+IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -74,9 +79,20 @@ DEFAULT_MODEL    = PROVIDERS[DEFAULT_PROVIDER]["default_model"]
 GROQ_URL         = PROVIDERS["groq"]["url"]
 GROQ_MODELS_URL  = PROVIDERS["groq"]["models_url"]
 
-CONFIG_DIR = Path.home() / ".config" / "dictate"
+if IS_WINDOWS:
+    # Settings roam with the profile; logs, failed clips and the model stay
+    # on this machine.
+    _roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    _local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    CONFIG_DIR = _roaming / "Dictate"
+    STATE_DIR = _local / "Dictate"
+    DATA_DIR = _local / "Dictate"
+else:
+    CONFIG_DIR = Path.home() / ".config" / "dictate"
+    STATE_DIR = Path.home() / ".local" / "state" / "dictate"
+    DATA_DIR = Path.home() / ".local" / "share" / "dictate"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-LOG_PATH = Path.home() / ".local" / "state" / "dictate" / "dictate.log"
+LOG_PATH = STATE_DIR / "dictate.log"
 
 log = logging.getLogger("dictate")
 
@@ -108,15 +124,21 @@ KEY_MAP.update({
     "alt_r":       {keyboard.Key.alt_r, keyboard.Key.alt_gr},
     "shift":       {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
     "super":       {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
-    # Mouse-side buttons. Sentinels are tuples emitted by evdev_listener;
-    # pynput won't see these (mouse events go through a separate listener) —
-    # so these hotkeys only work when the evdev backend is active.
-    "mouse_back":    {("mouse", "back")},
-    "mouse_forward": {("mouse", "forward")},
-    "mouse_side":    {("mouse", "side")},
-    "mouse_extra":   {("mouse", "extra")},
+    # Mouse-side buttons. Sentinels are tuples: evdev_listener emits the
+    # Linux button names, the pynput mouse listener (Windows, macOS, X11)
+    # emits ("mouse", "x1") / ("mouse", "x2") for the two thumb buttons
+    # Windows calls XBUTTON1 (back) and XBUTTON2 (forward). Logitech's
+    # BTN_SIDE/BTN_EXTRA are the same two physical buttons, so both names
+    # accept them. mouse_task has no pynput equivalent.
+    "mouse_back":    {("mouse", "back"),    ("mouse", "x1")},
+    "mouse_forward": {("mouse", "forward"), ("mouse", "x2")},
+    "mouse_side":    {("mouse", "side"),    ("mouse", "x1")},
+    "mouse_extra":   {("mouse", "extra"),   ("mouse", "x2")},
     "mouse_task":    {("mouse", "task")},
 })
+
+# Hotkeys the pynput backend (everything but Linux-evdev) cannot deliver.
+EVDEV_ONLY_KEYS = {"mouse_task"}
 
 DEFAULT_CONFIG = {
     "provider":              DEFAULT_PROVIDER,
@@ -129,6 +151,22 @@ DEFAULT_CONFIG = {
     "local_stt_num_threads": 4,    # sherpa-onnx CPU thread count for parakeet_local
     "yorik_url":             "http://127.0.0.1:8000",  # Yorik base URL (provider "yorik")
     "yorik_token":           "",   # personal API token from Yorik Settings → API tokens
+    # Optional polishing of the transcript through a local Gemma 4 model
+    # (see polish.py). Off by default; nothing is downloaded until the user
+    # asks for it in Settings.
+    "polish_enabled":        False,
+    "polish_backend":        "builtin", # builtin (Dictate's own llama-server) | external (a server already running)
+    "polish_external_url":   "http://127.0.0.1:11434/v1",  # OpenAI-compatible base URL (Ollama default)
+    "polish_external_model": "",       # model name the external server expects, e.g. "gemma4:e2b"
+    "polish_external_key":   "",       # API key, if the server wants one
+    "polish_model":          "gemma4-e2b-q4",
+    "polish_device":         "auto",   # auto | cuda | vulkan | cpu
+    "polish_threads":        4,        # CPU threads for llama-server
+    "polish_timeout":        8.0,      # seconds; after that the raw text is typed
+    "polish_style":          "",       # the user's own texts as a style sample
+    "polish_vocabulary":     "",       # names and terms, one per line; fixes sound-alike misspellings
+    "polish_default_instructions": "", # "" -> polish.DEFAULT_INSTRUCTIONS
+    "polish_profiles":       None,     # None -> polish.DEFAULT_PROFILES
 }
 
 
@@ -177,7 +215,24 @@ def save_config(cfg):
         pass
 
 
+_notifier = None
+
+
+def set_notifier(fn):
+    """Route notify() through fn(msg, urgency, timeout_ms) instead of
+    notify-send. The GUI registers its tray icon here on Windows and macOS,
+    where there is no notify-send. fn is called from worker threads."""
+    global _notifier
+    _notifier = fn
+
+
 def notify(msg, urgency="normal", timeout_ms=1500):
+    if _notifier is not None:
+        try:
+            _notifier(msg, urgency, timeout_ms)
+        except Exception:
+            log.exception("notifier failed")
+        return
     try:
         subprocess.run(
             ["notify-send", "-u", urgency, "-t", str(timeout_ms), "Dictate", msg],
@@ -196,11 +251,15 @@ def type_text(text):
     # writes raw US-QWERTY scancodes via /dev/uinput — layout-agnostic and
     # therefore wrong for non-US keyboards, but there is no better option
     # for global typing into native Wayland windows today.
-    import os
-    if os.name == "nt" or sys.platform == "darwin":
+    if IS_WINDOWS or IS_MACOS:
         # Windows / macOS: no xdotool or ydotool; pynput types through the
-        # OS input API and respects the active keyboard layout.
-        keyboard.Controller().type(text)
+        # OS input API (SendInput with Unicode on Windows), so umlauts and
+        # any layout come out right.
+        try:
+            keyboard.Controller().type(text)
+        except Exception as e:
+            log.exception("typing failed")
+            notify(f"Typing failed ({e})", urgency="critical", timeout_ms=5000)
         return
     on_x11 = os.environ.get("XDG_SESSION_TYPE") == "x11"
     tools = ["xdotool", "ydotool"] if on_x11 else ["ydotool", "xdotool"]
